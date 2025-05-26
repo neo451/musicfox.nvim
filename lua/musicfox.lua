@@ -1,6 +1,9 @@
 local api, fn, uv = vim.api, vim.fn, vim.uv
 local state = {}
+local M = {}
 
+---@class musicfox.config
+---@field statusline { enabled: boolean, format: fun(musicfox.metadata): string }
 local config = {
 	statusline = {
 		enabled = true,
@@ -10,21 +13,35 @@ local config = {
 	},
 }
 
----@param buf integer
----@return integer
-local function open_win(buf)
+---@return vim.api.keyset.win_config
+local function win_opts()
 	local width = math.floor(vim.o.columns * 0.8)
 	local height = math.floor(vim.o.lines * 0.8)
 	local col = (vim.o.columns - width) / 2
 	local row = (vim.o.lines - height) / 2
-	local win = api.nvim_open_win(buf, true, {
+	return {
 		relative = "editor",
 		width = width,
 		height = height,
-		row = row,
 		col = col,
-	})
+		row = row,
+		border = "solid",
+	}
+end
+
+---@param buf integer
+---@param enter boolean
+---@return integer
+local function open_win(buf, enter)
+	local win = api.nvim_open_win(buf, enter, win_opts())
 	vim.cmd("startinsert")
+	state.group = api.nvim_create_augroup("musicfox", { clear = true })
+	api.nvim_create_autocmd("VimResized", {
+		group = state.group,
+		callback = function()
+			api.nvim_win_set_config(win, win_opts())
+		end,
+	})
 	return win
 end
 
@@ -45,13 +62,17 @@ end
 local function open()
 	if not state.buf then
 		local buf = api.nvim_create_buf(false, true)
-		state.win = open_win(buf)
+		state.win = open_win(buf, true)
 		fn.jobstart({ "musicfox" }, { term = true })
 		vim.bo[buf].filetype = "musicfox"
-		vim.keymap.set("t", "q", "<cmd>close<cr>", { buffer = buf })
+		vim.keymap.set("t", "q", function()
+			api.nvim_del_augroup_by_id(state.group)
+			state.group = nil
+			vim.cmd("close")
+		end, { buffer = buf })
 		state.buf = buf
 	else
-		open_win(state.buf)
+		open_win(state.buf, true)
 	end
 end
 
@@ -64,18 +85,7 @@ local name2pattern = {
 	length = "musicfox mpris:length%s+(.+)",
 }
 
-local lyrics = [[
-[00:01.00]作曲 : 野田洋次郎
-[00:31.40]まだこの世界は [看来这世界]
-[00:34.40]僕を飼いならしていたいみたいな [似乎还想要驯服我]
-[00:39.40]望み通リいいだろう?美しくもがくよ [那就如你所愿吧 我会美丽地挣扎到底]
-[00:47.40]互いの砂時計 [看着彼此的沙漏]
-[00:51.40]眺めながらキスをしようよ [温柔地轻吻吧]
-[00:55.40]さよならから一番遠い [分别后最遥远的地方]
-[00:59.40]場所で待ち合わせよ [让我们彼此相约吧]
-]]
-
-local function convert_timestamp_to_seconds(timestamp)
+local function timestamp2seconds(timestamp)
 	-- Split the timestamp into minutes and the remaining part
 	local minutes_str, rest = timestamp:match("^(%d+):(.+)$")
 	if not minutes_str then
@@ -97,22 +107,26 @@ local function convert_timestamp_to_seconds(timestamp)
 	-- Calculate total seconds with floating point precision
 	local total_seconds = minutes * 60 + seconds + fractions / (10 ^ fraction_length)
 
-	return total_seconds / 10
+	return total_seconds
 end
 
 local lyric_pattern = "%[(%d%d:%d%d%.%d%d)%](.+)"
 
+---@return number[]
+---@return string[]
 local function parse_lyrics(str)
-	local time2lyric = {}
+	local poses = {}
+	local lyrics = {}
 	for line in vim.gsplit(str, "\n") do
 		local timestamp, lyric = line:match(lyric_pattern)
 		if timestamp then
-			local pos = convert_timestamp_to_seconds(timestamp)
+			local pos = timestamp2seconds(timestamp)
 			assert(pos)
-			time2lyric[pos] = lyric
+			poses[#poses + 1] = pos
+			lyrics[#lyrics + 1] = lyric
 		end
 	end
-	return time2lyric
+	return poses, lyrics
 end
 
 ---@class musicfox.metadata
@@ -140,73 +154,85 @@ local function parse_metadata(str)
 	return res
 end
 
----@return string?
-local function update_statusline()
-	state.player_name = state.player_name or get_playername()
-	local obj = vim.system({ "playerctl", "-p", state.player_name, "metadata" }):wait()
-
-	if obj then
-		local metadata = parse_metadata(obj.stdout)
-		return config.statusline.format(metadata)
-	else
-		error()
-	end
-end
-
-local function get_metadata()
-	local metadata = vim.system({ "playerctl", "-p", state.player_name, "metadata" }):wait()
-	return metadata.stdout
-end
-
----@return string?
-local function update_lyric()
-	state.player_name = state.player_name or get_playername()
-	local obj = vim.system({ "playerctl", "-p", state.player_name, "position" }):wait()
-
-	if obj then
-		-- BUG:
-		local pos = tonumber(obj.stdout)
-		local t2l = parse_lyrics(get_metadata())
-
-		local ts = vim.tbl_keys(t2l)
-		-- vim.print(pos, ts)
-
-		for i, t in ipairs(ts) do
-			if pos <= t then
-				return t2l[ts[i - 1]]
-			end
-		end
-	else
-		error()
-	end
-end
-
 ---@param cmd string
 ---@return function
 local function playerctl(cmd)
 	state.player_name = state.player_name or get_playername()
 	return function()
-		vim.system({ "playerctl", "-p", state.player_name, cmd })
+		return vim.system({ "playerctl", "-p", state.player_name, cmd })
 	end
 end
 
-return {
-	setup = function(opts)
-		if config.statusline.enabled then
-			local timer = uv.new_timer()
-			assert(timer)
+---@return string
+local function get_metadata()
+	local obj = playerctl("metadata")():wait()
+	assert(obj)
+	return obj.stdout
+end
 
-			timer:start(0, 1000, function()
-				vim.schedule(function()
-					vim.g.musicfox = update_statusline()
-					vim.g.musicfox_lyric = update_lyric()
-				end)
-			end)
+---@return number
+local function get_position()
+	local obj = playerctl("position")():wait()
+	assert(obj)
+	return assert(tonumber(obj.stdout))
+end
+
+local function time_job(t, f)
+	local timer = uv.new_timer()
+	assert(timer)
+	timer:start(0, t, vim.schedule_wrap(f))
+end
+
+---@return string?
+local function update_lyric()
+	local pos = get_position()
+	local ts, ls = parse_lyrics(get_metadata())
+
+	for i, t in ipairs(ts) do
+		if pos <= t then
+			return ls[i - 1]
 		end
-		config = vim.tbl_extend("force", config, opts)
-		vim.keymap.set("n", "<Plug>MusicfoxOpen", open)
-		vim.keymap.set("n", "<Plug>MusicfoxPlayPause", playerctl("play-pause"))
-		vim.keymap.set("n", "<Plug>MusicfoxNext", playerctl("next"))
-		vim.keymap.set("n", "<Plug>MusicfoxPrevious", playerctl("previous"))
-	end,
-}
+	end
+end
+
+-- TODO: difference pos preset
+-- TODO: close
+-- TODO: winhighlight
+local function float_lyrics()
+	local buf = api.nvim_create_buf(false, true)
+	state.lyrics = open_win(buf, false)
+	api.nvim_win_set_config(state.lyrics, {
+		height = 1,
+		style = "minimal",
+	})
+	time_job(500, function()
+		api.nvim_buf_set_lines(buf, 0, 1, false, { vim.g.musicfox_lyric })
+	end)
+end
+
+---@return string?
+local function update_metadata()
+	local metadata = parse_metadata(get_metadata())
+	return config.statusline.format(metadata)
+end
+
+M.setup = function(opts)
+	if config.statusline.enabled then
+		time_job(1000, function()
+			vim.schedule(function()
+				vim.g.musicfox = update_metadata()
+				vim.g.musicfox_lyric = update_lyric()
+			end)
+		end)
+	end
+	config = vim.tbl_extend("force", config, opts)
+	vim.keymap.set("n", "<Plug>MusicfoxOpen", open)
+	vim.keymap.set("n", "<Plug>MusicfoxPlayPause", playerctl("play-pause"))
+	vim.keymap.set("n", "<Plug>MusicfoxNext", playerctl("next"))
+	vim.keymap.set("n", "<Plug>MusicfoxPrevious", playerctl("previous"))
+	vim.keymap.set("n", "<Plug>MusicfoxLyrics", float_lyrics)
+end
+
+M.timestamp2seconds = timestamp2seconds
+
+return M
