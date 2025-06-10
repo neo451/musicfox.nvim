@@ -19,10 +19,10 @@ return { "neo451/musicfox.nvim", opts = {} }
 
 Provides following plug mappings:
 
-- `MusicfoxOpen`
-- `MusicfoxPlayPause`
-- `MusicfoxNext`
-- `MusicfoxPrevious`
+- `MusicfoxOpen`: Open TUI in a floating window
+- `MusicfoxPlayPause`: Toggle between play and pause
+- `MusicfoxNext`: Next Song
+- `MusicfoxPrevious`: Previous Song
 
 Map like:
 
@@ -84,4 +84,5 @@ musicfox
 - more advanced action beyond `playerctl`
   - heart
   - download
+  - play mode
   - ...
